@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """「世界の株価」ページを撮影して1枚のJPEGにする。
 
-既定では https://nikkei225jp.com/ をビューポート幅1000pxで開き、チャートの描画を待って
-ビューポートをそのまま撮る。撮影範囲は環境変数で調整できる（初回だけ現物を見て合わせる想定）。
+既定では https://sekai-kabuka.com/pc-index.html をビューポート幅1000pxで開き、
+チャートの描画を待ってビューポートをそのまま撮る。
+撮影範囲は環境変数で調整できる（初回だけ現物を見て合わせる想定）。
 
 環境変数:
   CAPTURE_URL     撮影対象URL            (既定: https://nikkei225jp.com/)
@@ -24,7 +25,7 @@ import sys
 
 from playwright.sync_api import sync_playwright
 
-URL = os.getenv("CAPTURE_URL", "https://nikkei225jp.com/")
+URL = os.getenv("CAPTURE_URL", "https://sekai-kabuka.com/pc-index.html")
 VIEWPORT = os.getenv("VIEWPORT", "1000x1320")
 SCROLL_Y = int(os.getenv("SCROLL_Y", "0"))
 CLIP = os.getenv("CLIP", "")
