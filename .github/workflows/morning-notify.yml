@@ -1,0 +1,88 @@
+# .github/workflows/morning-notify.yml
+name: market-line-notify
+
+on:
+  schedule:
+    # UTC表記（JST−9時間）。平日 8:00 / 11:40 / 15:00 / 18:00 JST の4回
+    # GitHub Actionsのcronは数分〜30分ほど遅れることがある
+    - cron: "0 23 * * 0-4"  # 月〜金 08:00 JST（UTCでは前日なので曜日は0-4）
+    - cron: "40 2 * * 1-5"  # 月〜金 11:40 JST
+    - cron: "0 6 * * 1-5"   # 月〜金 15:00 JST
+    - cron: "0 9 * * 1-5"   # 月〜金 18:00 JST
+  workflow_dispatch:
+    inputs:
+      skip_image:
+        description: "画像を撮らずFlexだけ送る（デバッグ用）"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write # スクリーンショットを snapshot ブランチに置くため
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # ブラウザをキャッシュして、LINEからのオンデマンド実行の待ち時間を縮める
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Capture world chart
+        if: ${{ inputs.skip_image != true }}
+        env:
+          # 撮影範囲の調整用。リポジトリの Settings > Variables で上書きできる
+          VIEWPORT: ${{ vars.VIEWPORT || '1000x1320' }}
+          SCROLL_Y: ${{ vars.SCROLL_Y || '0' }}
+          CLIP: ${{ vars.CLIP }}
+          WAIT_MS: ${{ vars.WAIT_MS || '9000' }}
+        run: python capture_world.py
+
+      # 撮れた画像はArtifactからダウンロードできる（範囲の微調整用）
+      - name: Upload screenshot artifact
+        if: ${{ inputs.skip_image != true }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: world-screenshot
+          path: world.jpg
+          retention-days: 7
+
+      # 画像をLINEから取得できるURLに置く。
+      # snapshot ブランチを毎回作り直すので、履歴に画像が溜まらない。
+      - name: Publish screenshot to snapshot branch
+        id: publish
+        if: ${{ inputs.skip_image != true }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan snapshot
+          git rm -rf --cached . > /dev/null
+          git add -f world.jpg
+          git commit -m "snapshot $(date -u +%FT%TZ)"
+          git push -f origin snapshot
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Send LINE notification
+        env:
+          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+          LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
+          BRIEF_URL: ${{ vars.BRIEF_URL || 'https://olrepth17-source.github.io/morning-brief/' }}
+          IMAGE_URL: >-
+            ${{ inputs.skip_image == true && '' ||
+            format('https://raw.githubusercontent.com/{0}/{1}/world.jpg',
+            github.repository, steps.publish.outputs.sha) }}
+        run: python notify_line.py
