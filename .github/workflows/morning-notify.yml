@@ -46,6 +46,7 @@ jobs:
         if: ${{ inputs.skip_image != true }}
         env:
           # 撮影範囲の調整用。リポジトリの Settings > Variables で上書きできる
+          CAPTURE_URL: ${{ vars.CAPTURE_URL || 'https://sekai-kabuka.com/pc-index.html' }}
           VIEWPORT: ${{ vars.VIEWPORT || '1000x1320' }}
           SCROLL_Y: ${{ vars.SCROLL_Y || '0' }}
           CLIP: ${{ vars.CLIP }}
