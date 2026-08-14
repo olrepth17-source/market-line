@@ -93,6 +93,24 @@ def main() -> None:
         page.goto(URL, wait_until="load", timeout=60_000)
         page.wait_for_timeout(WAIT_MS)  # チャートは遅れて描画されるので待つ
 
+        # ページ下部のチャートは遅延読み込みのため、一度最下部までスクロールして
+        # 全て描画させてから先頭に戻る（これをしないと下の段が空白/切れになる）
+        page.evaluate(
+            """async () => {
+              await new Promise((res) => {
+                let y = 0;
+                const step = () => {
+                  y += 500;
+                  window.scrollTo(0, y);
+                  if (y < document.body.scrollHeight) setTimeout(step, 250);
+                  else { window.scrollTo(0, 0); res(); }
+                };
+                step();
+              });
+            }"""
+        )
+        page.wait_for_timeout(2500)  # スクロールで発火した描画の完了待ち
+
         if grid:
             page.evaluate(GRID_JS)
             page.screenshot(path="debug_full.jpg", type="jpeg", quality=70, full_page=True)
@@ -111,6 +129,8 @@ def main() -> None:
             page.evaluate(BANNER_JS, {"label": label, "fixed": False,
                                       "x": x, "y": by, "w": cw, "h": y - by or BANNER_H})
             shot_args["clip"] = {"x": x, "y": by, "width": cw, "height": ch + (y - by)}
+            # ビューポートより下も含めて撮るにはfull_pageが必須（無いと画面の高さで切れる）
+            shot_args["full_page"] = True
         else:
             if SCROLL_Y:
                 page.evaluate(f"window.scrollTo(0, {SCROLL_Y})")
