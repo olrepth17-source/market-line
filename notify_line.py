@@ -37,6 +37,8 @@ LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 
 BRIEF_URL = os.getenv("BRIEF_URL", "https://olrepth17-source.github.io/morning-brief/")
 WORLD_URL = "https://nikkei225jp.com/"
+NIKKEI_VI_LINK = "https://www.nikkei.com/marketdata/quote/NK225VI/"
+CNN_FG_LINK = "https://edition.cnn.com/markets/fear-and-greed"
 
 BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -72,20 +74,24 @@ WEEKDAY_EN = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 # ---------------------------------------------------------------- データ取得
 
-def fetch_nikkei_vi() -> list[tuple[datetime, float]]:
-    """日経平均VIの日次CSVを [(日付, 終値), ...] 古い順で返す。"""
+def fetch_nikkei_vi() -> list[tuple[datetime, float, float]]:
+    """日経平均VIの日次CSVを [(日付, 終値, 高値), ...] 古い順で返す。
+
+    列並びは 日付,始値,終値,高値,安値。
+    """
     r = requests.get(NIKKEI_VI_CSV, timeout=TIMEOUT, headers={"User-Agent": BROWSER_UA})
     r.raise_for_status()
-    rows: list[tuple[datetime, float]] = []
+    rows: list[tuple[datetime, float, float]] = []
     for cols in csv.reader(io.StringIO(r.content.decode("cp932", errors="replace"))):
-        if len(cols) < 3:
+        if len(cols) < 5:
             continue
         try:
             d = datetime.strptime(cols[0].strip(), "%Y/%m/%d")
             close = float(cols[2].strip())
+            high = float(cols[3].strip())
         except ValueError:
             continue  # ヘッダー行・末尾の注記行
-        rows.append((d, close))
+        rows.append((d, close, high))
     if not rows:
         raise ValueError("日経VIのCSVから有効な行を取得できませんでした")
     rows.sort(key=lambda r: r[0])
@@ -113,27 +119,28 @@ def mean(values: list[float]) -> float | None:
 
 def fg_stats(payload: dict) -> dict:
     cur = payload["fear_and_greed"]
-    hist = [
+    hist = sorted(
         (datetime.fromtimestamp(p["x"] / 1000, tz=timezone.utc), float(p["y"]))
         for p in payload.get("fear_and_greed_historical", {}).get("data", [])
-    ]
-    now = datetime.now(timezone.utc)
+    )
+    vals = [v for _, v in hist]
     return {
         "score": float(cur["score"]),
         "prev": float(cur["previous_close"]),
-        "week_avg": mean([v for t, v in hist if t >= now - timedelta(days=7)]),
-        "month_avg": mean([v for t, v in hist if t >= now - timedelta(days=30)]),
+        "avg5": mean(vals[-5:]),    # 直近5データ日
+        "avg25": mean(vals[-25:]),  # 直近25データ日
     }
 
 
-def vi_stats(rows: list[tuple[datetime, float]]) -> dict:
-    closes = [v for _, v in rows]
+def vi_stats(rows: list[tuple[datetime, float, float]]) -> dict:
+    closes = [c for _, c, _ in rows]
     return {
         "date": rows[-1][0],
         "value": closes[-1],
+        "high": rows[-1][2],
         "prev": closes[-2] if len(closes) >= 2 else None,
-        "week_avg": mean(closes[-5:]),    # 直近5営業日
-        "month_avg": mean(closes[-21:]),  # 直近21営業日
+        "avg5": mean(closes[-5:]),    # 直近5営業日
+        "avg25": mean(closes[-25:]),  # 直近25営業日
     }
 
 
@@ -163,10 +170,10 @@ def delta_text(cur: float, prev: float | None, digits: int = 2) -> tuple[str, st
     return f"前日比 {d:+.{digits}f}{pct}", ""
 
 
-def avg_text(week: float | None, month: float | None, unit: str) -> str:
-    w = f"{week:.2f}" if week is not None else "—"
-    m = f"{month:.2f}" if month is not None else "—"
-    return f"週平均 {w} ／ 月平均 {m}  ({unit})"
+def avg_text(a5: float | None, a25: float | None) -> str:
+    v5 = f"{a5:.2f}" if a5 is not None else "—"
+    v25 = f"{a25:.2f}" if a25 is not None else "—"
+    return f"5日平均 {v5} ／ 25日平均 {v25}"
 
 
 # ---------------------------------------------------------------- Flex組み立て
@@ -174,6 +181,7 @@ def avg_text(week: float | None, month: float | None, unit: str) -> str:
 def metric_block(
     title: str, note: str, value: str, value_color: str,
     badge: str, badge_color: str, delta: str, delta_color: str, avg: str,
+    extra: str = "", extra_color: str = SUB,
 ) -> dict:
     value_row: list[dict] = [
         {"type": "text", "text": value, "size": "xxl", "weight": "bold", "color": value_color, "flex": 0},
@@ -192,8 +200,10 @@ def metric_block(
         },
         {"type": "box", "layout": "baseline", "spacing": "sm", "margin": "sm", "contents": value_row},
         {"type": "text", "text": delta, "size": "sm", "color": delta_color, "margin": "xs"},
-        {"type": "text", "text": avg, "size": "xs", "color": SUB, "margin": "xs"},
     ]
+    if extra:
+        contents.append({"type": "text", "text": extra, "size": "sm", "color": extra_color, "margin": "xs"})
+    contents.append({"type": "text", "text": avg, "size": "xs", "color": SUB, "margin": "xs"})
     return {"type": "box", "layout": "vertical", "margin": "lg", "contents": contents}
 
 
@@ -217,6 +227,9 @@ def build_flex(vi: dict | None, fg: dict | None, today: datetime) -> dict:
         d_text, _ = delta_text(v, vi["prev"])
         # VIは上昇＝リスク上昇なので赤、低下＝緑
         d_color = SUB if vi["prev"] is None else (RED if v >= vi["prev"] else DEEP_GREEN)
+        # ザラ場中に跳ねて終値だけ収まる日があるので当日高値を併記。40超なら高値側も色を付ける
+        high = vi.get("high")
+        high_color = vi_band(high)[0] if high is not None else SUB
         body.append(metric_block(
             title="日経VI",
             note=f"{vi['date'].strftime('%m/%d')} 終値",
@@ -226,7 +239,9 @@ def build_flex(vi: dict | None, fg: dict | None, today: datetime) -> dict:
             badge_color=v_badge_color,
             delta=d_text,
             delta_color=d_color,
-            avg=avg_text(vi["week_avg"], vi["month_avg"], "5/21営業日"),
+            avg=avg_text(vi["avg5"], vi["avg25"]),
+            extra=f"当日高値 {high:.2f}" if high is not None else "",
+            extra_color=SUB if high_color == INK else high_color,
         ))
     else:
         body.append({"type": "text", "text": "日経VI 取得失敗", "size": "sm",
@@ -249,7 +264,7 @@ def build_flex(vi: dict | None, fg: dict | None, today: datetime) -> dict:
             badge_color=color,
             delta=d_text,
             delta_color=d_color,
-            avg=avg_text(fg["week_avg"], fg["month_avg"], "7/30日"),
+            avg=avg_text(fg["avg5"], fg["avg25"]),
         ))
     else:
         body.append({"type": "text", "text": "F&G指数 取得失敗", "size": "sm",
@@ -265,6 +280,14 @@ def build_flex(vi: dict | None, fg: dict | None, today: datetime) -> dict:
                  "action": {"type": "uri", "label": "ざっくり朝ビュー", "uri": BRIEF_URL}},
                 {"type": "button", "style": "secondary", "height": "sm",
                  "action": {"type": "uri", "label": "世界の株価", "uri": WORLD_URL}},
+                {
+                    "type": "box", "layout": "horizontal", "contents": [
+                        {"type": "button", "style": "link", "height": "sm",
+                         "action": {"type": "uri", "label": "日経VI", "uri": NIKKEI_VI_LINK}},
+                        {"type": "button", "style": "link", "height": "sm",
+                         "action": {"type": "uri", "label": "F&G (CNN)", "uri": CNN_FG_LINK}},
+                    ],
+                },
             ],
         },
     }
