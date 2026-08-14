@@ -22,8 +22,12 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import datetime, timedelta, timezone
 
 from playwright.sync_api import sync_playwright
+
+JST = timezone(timedelta(hours=9))
+BANNER_H = 44  # 取得日時バーの高さ(px)
 
 URL = os.getenv("CAPTURE_URL", "https://sekai-kabuka.com/pc-index.html")
 VIEWPORT = os.getenv("VIEWPORT", "1000x1320")
@@ -32,6 +36,22 @@ CLIP = os.getenv("CLIP", "")
 WAIT_MS = int(os.getenv("WAIT_MS", "9000"))
 OUTPUT = os.getenv("OUTPUT", "world.jpg")
 MAX_BYTES = int(os.getenv("MAX_BYTES", "900000"))
+
+BANNER_JS = """
+(args) => {
+  const d = document.createElement('div');
+  d.textContent = args.label;
+  d.style.cssText =
+    (args.fixed
+      ? 'position:fixed;left:0;top:0;width:100%;'
+      : `position:absolute;left:${args.x}px;top:${args.y}px;width:${args.w}px;`) +
+    `height:${args.h}px;background:#17303F;color:#fff;` +
+    'font:bold 21px/1 -apple-system,"Hiragino Sans","Noto Sans JP",sans-serif;' +
+    'display:flex;align-items:center;padding-left:14px;box-sizing:border-box;' +
+    'z-index:2147483647';
+  document.body.appendChild(d);
+}
+"""
 
 GRID_JS = """
 () => {
@@ -80,13 +100,22 @@ def main() -> None:
             browser.close()
             return
 
+        # 「画像が何時のデータか」を画像自体に焼き込む
+        label = datetime.now(JST).strftime("データ取得 %Y/%m/%d %H:%M JST")
+
         shot_args: dict = {"type": "jpeg"}
         if CLIP:
             x, y, cw, ch = (int(v) for v in CLIP.split(","))
-            shot_args["clip"] = {"x": x, "y": y, "width": cw, "height": ch}
-        elif SCROLL_Y:
-            page.evaluate(f"window.scrollTo(0, {SCROLL_Y})")
-            page.wait_for_timeout(800)
+            # 切り抜き範囲の直上に日時バーを足し、その分だけ範囲を上へ広げる
+            by = max(0, y - BANNER_H)
+            page.evaluate(BANNER_JS, {"label": label, "fixed": False,
+                                      "x": x, "y": by, "w": cw, "h": y - by or BANNER_H})
+            shot_args["clip"] = {"x": x, "y": by, "width": cw, "height": ch + (y - by)}
+        else:
+            if SCROLL_Y:
+                page.evaluate(f"window.scrollTo(0, {SCROLL_Y})")
+                page.wait_for_timeout(800)
+            page.evaluate(BANNER_JS, {"label": label, "fixed": True, "h": BANNER_H})
 
         quality = 85
         while True:
