@@ -42,20 +42,25 @@ jobs:
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
+      # 撮影に失敗しても通知自体は送るので continue-on-error
       - name: Capture world chart
+        id: capture
         if: ${{ inputs.skip_image != true }}
+        continue-on-error: true
         env:
-          # 撮影範囲の調整用。リポジトリの Settings > Variables で上書きできる
+          # Settings > Variables で上書きできる
           CAPTURE_URL: ${{ vars.CAPTURE_URL || 'https://sekai-kabuka.com/pc-index.html' }}
+          CLIP: ${{ vars.CLIP }}
+          FALLBACK_URL: ${{ vars.FALLBACK_URL || 'https://nikkei225jp.com/' }}
+          FALLBACK_CLIP: ${{ vars.FALLBACK_CLIP }}
           VIEWPORT: ${{ vars.VIEWPORT || '1000x1320' }}
           SCROLL_Y: ${{ vars.SCROLL_Y || '0' }}
-          CLIP: ${{ vars.CLIP }}
           WAIT_MS: ${{ vars.WAIT_MS || '9000' }}
         run: python capture_world.py
 
       # 撮れた画像はArtifactからダウンロードできる（範囲の微調整用）
       - name: Upload screenshot artifact
-        if: ${{ inputs.skip_image != true }}
+        if: ${{ hashFiles('world.jpg') != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: world-screenshot
@@ -66,7 +71,7 @@ jobs:
       # snapshot ブランチを毎回作り直すので、履歴に画像が溜まらない。
       - name: Publish screenshot to snapshot branch
         id: publish
-        if: ${{ inputs.skip_image != true }}
+        if: ${{ steps.capture.outcome == 'success' && hashFiles('world.jpg') != '' }}
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -82,8 +87,9 @@ jobs:
           LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
           LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
           BRIEF_URL: ${{ vars.BRIEF_URL || 'https://olrepth17-source.github.io/morning-brief/' }}
+          # 画像を publish できたときだけURLを渡す。空ならFlexのみ送られる
           IMAGE_URL: >-
-            ${{ inputs.skip_image == true && '' ||
+            ${{ steps.publish.outputs.sha &&
             format('https://raw.githubusercontent.com/{0}/{1}/world.jpg',
-            github.repository, steps.publish.outputs.sha) }}
+            github.repository, steps.publish.outputs.sha) || '' }}
         run: python notify_line.py
