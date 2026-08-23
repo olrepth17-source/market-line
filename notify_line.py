@@ -22,6 +22,7 @@ import csv
 import io
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -32,6 +33,8 @@ JST = timezone(timedelta(hours=9))
 TIMEOUT = 30
 
 NIKKEI_VI_CSV = "https://indexes.nikkei.co.jp/nkave/historical/nikkei_stock_average_vi_daily_jp.csv"
+# ザラ場中の値（15秒更新）が載る日経公式のプロフィールページ
+NIKKEI_VI_PROFILE = "https://indexes.nikkei.co.jp/nkave/index/profile?idx=nk225vi"
 CNN_FG_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
 LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 
@@ -98,6 +101,62 @@ def fetch_nikkei_vi() -> list[tuple[datetime, float, float]]:
     return rows
 
 
+def _html_to_text(html: str) -> str:
+    """タグを空白に潰して、ラベルと数値の並びだけが残るテキストにする。"""
+    html = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html)
+    text = re.sub(r"(?s)<[^>]+>", " ", html)
+    text = text.replace("&nbsp;", " ")
+    return re.sub(r"\s+", " ", text)
+
+
+# 「28.38 -4.38% -1.30 2026.08.21(15:50)」の並びを拾う
+# 上昇日は「+1.38」「+4.36%」のように符号が付くので [-+]? を許す
+VI_RT_RE = re.compile(
+    r"([-+]?[\d,]+\.\d+)\s+([-+]?[\d,]+\.\d+)%\s+([-+]?[\d,]+\.\d+)\s+"
+    r"(\d{4})\.(\d{2})\.(\d{2})\((\d{2}):(\d{2})\)"
+)
+
+
+def fetch_vi_realtime() -> dict | None:
+    """日経公式のプロフィールページからザラ場中の日経VIを取る（15秒更新）。
+
+    取れなければ None を返し、呼び出し側は日次CSV（前営業日終値）にフォールバックする。
+    """
+    try:
+        r = requests.get(
+            NIKKEI_VI_PROFILE,
+            timeout=TIMEOUT,
+            headers={"User-Agent": BROWSER_UA, "Accept-Language": "ja,en;q=0.8"},
+        )
+        r.raise_for_status()
+        text = _html_to_text(r.content.decode("utf-8", errors="replace"))
+    except requests.RequestException as e:
+        print(f"VIリアルタイム取得エラー: {type(e).__name__}: {e}", file=sys.stderr)
+        return None
+
+    m = VI_RT_RE.search(text)
+    if not m:
+        print("VIリアルタイム: ページ構造が想定と異なるためCSVにフォールバック", file=sys.stderr)
+        return None
+
+    value, pct, diff, y, mo, d, hh, mi = m.groups()
+
+    def labeled(label: str) -> float | None:
+        hit = re.search(label + r"\s*([-+]?[\d,]+\.\d+)", text)
+        return float(hit.group(1).replace(",", "")) if hit else None
+
+    return {
+        "value": float(value.replace(",", "").lstrip("+")),
+        "diff": float(diff.replace(",", "")),
+        "pct": float(pct.replace(",", "")),
+        "date": datetime(int(y), int(mo), int(d)),
+        "time": f"{hh}:{mi}",
+        "open": labeled("始値"),
+        "high": labeled("高値"),
+        "low": labeled("安値"),
+    }
+
+
 def fetch_fear_greed() -> dict:
     """CNNのFear&Greed指数を取得する（非公式エンドポイント。UAが無いと弾かれる）。"""
     r = requests.get(
@@ -132,16 +191,41 @@ def fg_stats(payload: dict) -> dict:
     }
 
 
-def vi_stats(rows: list[tuple[datetime, float, float]]) -> dict:
+def vi_stats(rows: list[tuple[datetime, float, float]], rt: dict | None = None) -> dict:
+    """日次CSV（履歴）とリアルタイム値を合成する。
+
+    現在値・当日の高安はリアルタイム側、5日/25日平均は確定した日足から計算する。
+    """
     closes = [c for _, c, _ in rows]
-    return {
+    st: dict = {
         "date": rows[-1][0],
+        "time": None,
+        "live": False,
         "value": closes[-1],
         "high": rows[-1][2],
+        "low": None,
+        "open": None,
         "prev": closes[-2] if len(closes) >= 2 else None,
-        "avg5": mean(closes[-5:]),    # 直近5営業日
-        "avg25": mean(closes[-25:]),  # 直近25営業日
+        "avg5": mean(closes[-5:]),    # 直近5営業日（確定値）
+        "avg25": mean(closes[-25:]),  # 直近25営業日（確定値）
     }
+    if not rt:
+        return st
+
+    st.update({
+        "date": rt["date"],
+        "time": rt["time"],
+        "live": True,
+        "value": rt["value"],
+        "open": rt["open"],
+        "low": rt["low"],
+        "high": rt["high"] if rt["high"] is not None else st["high"],
+        "diff": rt["diff"],
+        "pct": rt["pct"],
+        # 前日終値はページの前日比から逆算（表示の一貫性のため保持）
+        "prev": rt["value"] - rt["diff"],
+    })
+    return st
 
 
 # ---------------------------------------------------------------- 表示ヘルパ
@@ -224,15 +308,38 @@ def build_flex(vi: dict | None, fg: dict | None, today: datetime) -> dict:
     if vi:
         v = vi["value"]
         v_color, v_badge, v_badge_color = vi_band(v)
-        d_text, _ = delta_text(v, vi["prev"])
+
+        # 前日比はリアルタイム側の値があればそれを使う（自前の引き算より正確）
+        if vi.get("diff") is not None:
+            d_text = f"前日比 {vi['diff']:+.2f} ({vi['pct']:+.1f}%)"
+            rising = vi["diff"] >= 0
+        else:
+            d_text, _ = delta_text(v, vi["prev"])
+            rising = vi["prev"] is not None and v >= vi["prev"]
         # VIは上昇＝リスク上昇なので赤、低下＝緑
-        d_color = SUB if vi["prev"] is None else (RED if v >= vi["prev"] else DEEP_GREEN)
-        # ザラ場中に跳ねて終値だけ収まる日があるので当日高値を併記。40超なら高値側も色を付ける
+        d_color = SUB if vi.get("prev") is None else (RED if rising else DEEP_GREEN)
+
+        # ザラ場中に跳ねて終値だけ収まる日があるので当日の高安を併記。40超なら色を付ける
         high = vi.get("high")
         high_color = vi_band(high)[0] if high is not None else SUB
+        day_parts = []
+        if high is not None:
+            day_parts.append(f"高値 {high:.2f}")
+        if vi.get("low") is not None:
+            day_parts.append(f"安値 {vi['low']:.2f}")
+        if vi.get("open") is not None:
+            day_parts.append(f"始値 {vi['open']:.2f}")
+
+        if vi.get("live"):
+            note = f"{vi['date'].strftime('%m/%d')} {vi['time']} 時点"
+            day_label = "本日 "
+        else:
+            note = f"{vi['date'].strftime('%m/%d')} 終値"
+            day_label = "当日 "
+
         body.append(metric_block(
             title="日経VI",
-            note=f"{vi['date'].strftime('%m/%d')} 終値",
+            note=note,
             value=f"{v:.2f}",
             value_color=v_color,
             badge=v_badge,
@@ -240,7 +347,7 @@ def build_flex(vi: dict | None, fg: dict | None, today: datetime) -> dict:
             delta=d_text,
             delta_color=d_color,
             avg=avg_text(vi["avg5"], vi["avg25"]),
-            extra=f"当日高値 {high:.2f}" if high is not None else "",
+            extra=(day_label + " ／ ".join(day_parts)) if day_parts else "",
             extra_color=SUB if high_color == INK else high_color,
         ))
     else:
@@ -296,7 +403,8 @@ def build_flex(vi: dict | None, fg: dict | None, today: datetime) -> dict:
 def build_alt_text(vi: dict | None, fg: dict | None, today: datetime) -> str:
     parts = [f"市況 {today.strftime('%m/%d %H:%M')}"]
     if vi:
-        parts.append(f"日経VI {vi['value']:.2f}")
+        stamp = f"({vi['time']})" if vi.get("live") else "(終値)"
+        parts.append(f"日経VI {vi['value']:.2f}{stamp}")
     if fg:
         parts.append(f"F&G {fg['score']:.0f} {fg_band(fg['score'])[0]}")
     return " ｜ ".join(parts)[:400]
@@ -344,7 +452,7 @@ def main() -> None:
 
     vi = None
     try:
-        vi = vi_stats(fetch_nikkei_vi())
+        vi = vi_stats(fetch_nikkei_vi(), fetch_vi_realtime())
     except Exception as e:  # noqa: BLE001 — 片方が落ちても通知は出す
         print(f"日経VI取得エラー: {type(e).__name__}: {e}", file=sys.stderr)
 
