@@ -2,13 +2,16 @@
 name: market-line-notify
 
 on:
+  # ▼ Cloudflare Workerの定時起動（Cron Trigger）を使う場合は、この schedule ブロックを
+  #   まるごと削除すること。両方生きていると二重に届く。
+  #   GitHub側のcronは混雑時に数十分〜数時間遅れる（公式に「遅延する／混雑時は破棄されることがある」と明記）。
+  #   毎時00分は最も混むため、ここでは3分前倒しの半端な分に置いて遅延を減らしている。
   schedule:
-    # UTC表記（JST−9時間）。平日 8:00 / 11:40 / 15:00 / 18:00 JST の4回
-    # GitHub Actionsのcronは数分〜30分ほど遅れることがある
-    - cron: "0 23 * * 0-4"  # 月〜金 08:00 JST（UTCでは前日なので曜日は0-4）
-    - cron: "40 2 * * 1-5"  # 月〜金 11:40 JST
-    - cron: "0 6 * * 1-5"   # 月〜金 15:00 JST
-    - cron: "0 9 * * 1-5"   # 月〜金 18:00 JST
+    # UTC表記（JST−9時間）
+    - cron: "57 22 * * 0-4" # 月〜金 07:57 JST（UTCでは前日なので曜日は0-4）
+    - cron: "37 2 * * 1-5"  # 月〜金 11:37 JST
+    - cron: "57 5 * * 1-5"  # 月〜金 14:57 JST
+    - cron: "57 8 * * 1-5"  # 月〜金 17:57 JST
   workflow_dispatch:
     inputs:
       skip_image:
